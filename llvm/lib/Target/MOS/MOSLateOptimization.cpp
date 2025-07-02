@@ -49,6 +49,8 @@ public:
   void lowerCmpZero(MachineInstr &MI) const;
   bool combineLdImm(MachineBasicBlock &MBB) const;
   bool tailJMP(MachineBasicBlock &MBB) const;
+  bool commutativeRuntime(MachineBasicBlock &MBB) const;
+  bool commutativeRuntimeByte(MachineBasicBlock &MBB, const char *runtimeName) const;
 };
 
 bool MOSLateOptimization::runOnMachineFunction(MachineFunction &MF) {
@@ -57,6 +59,7 @@ bool MOSLateOptimization::runOnMachineFunction(MachineFunction &MF) {
     Changed |= lowerCmpZeros(MBB);
     Changed |= combineLdImm(MBB);
     Changed |= tailJMP(MBB);
+    Changed |= commutativeRuntime(MBB);
   }
   return Changed;
 }
@@ -410,6 +413,67 @@ bool MOSLateOptimization::tailJMP(MachineBasicBlock &MBB) const {
   RTS.eraseFromParent();
   JSR.setDesc(JSR.getMF()->getSubtarget().getInstrInfo()->get(MOS::TailJMP));
   return true;
+}
+
+// When a operation uses a run-time routine that known to be commutative,
+// some parameter swaps can be eliminated
+bool MOSLateOptimization::commutativeRuntime(MachineBasicBlock &MBB) const {
+  bool Changed = commutativeRuntimeByte(MBB, "__mulqi3");
+  
+  // Future expansion for a commutativeRuntimeWord() 
+  // that does something similar with __mulhi3
+  // (Not sure if that's worth it)
+  
+  return Changed;
+}
+
+bool MOSLateOptimization::commutativeRuntimeByte(MachineBasicBlock &MBB, const char * runtimeName) const {
+  bool Changed = false;
+
+  for(MachineInstr &MI : MBB) {
+    // Look for JSR, OR a TailJMP lowering 
+    auto opCode = MI.getOpcode();
+    if (!(opCode == MOS::JSR || opCode == MOS::TailJMP))
+      continue;
+
+    // Is this a call to the commutative runtime routine?
+    bool isCommutative = false;
+    for (auto operand : MI.operands())
+    {
+      if (operand.isSymbol() && 0==std::strcmp(operand.getSymbolName(), runtimeName)) {
+        isCommutative = true;
+        break;
+      }
+    }
+    if(!isCommutative)
+      continue;
+    
+    // MI node represents a JMP or JSR to a commutative call   
+    // Get three previous instructions
+    MachineInstr *prev1 = MI.getPrevNode();
+    MachineInstr *prev2 = prev1 ? prev1->getPrevNode() : NULL;
+    MachineInstr *prev3 = prev2 ? prev2->getPrevNode() : NULL;
+    if (!(prev1 && prev2 && prev3))
+      continue;
+
+    // Looking for the pattern that exchanges A and X before the call
+    // prev3: STX (register)
+    // prev2: TAX
+    // prev1: LDA (same register)
+    if ((prev3->getOpcode() == MOS::STImag8 && prev3->getOperand(1).getReg()==MOS::X) &&
+        (prev2->getOpcode() == MOS::TA      && prev2->getOperand(0).getReg()==MOS::X) &&
+        (prev1->getOpcode() == MOS::LDImag8 && prev1->getOperand(0).getReg()==MOS::A) &&
+        (prev1->getOperand(1).getReg() == prev3->getOperand(0).getReg())) {
+      
+      // Remove the a/x wapping code, saving 5 bytes
+      prev1->eraseFromParent(); 
+      prev2->eraseFromParent();
+      prev3->eraseFromParent();
+
+      Changed = true;
+    }
+  }
+  return Changed;
 }
 
 } // namespace
