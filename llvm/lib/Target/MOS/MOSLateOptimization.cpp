@@ -465,7 +465,7 @@ bool MOSLateOptimization::commutativeRuntimeByte(MachineBasicBlock &MBB, const c
         (prev1->getOpcode() == MOS::LDImag8 && prev1->getOperand(0).getReg()==MOS::A) &&
         (prev1->getOperand(1).getReg() == prev3->getOperand(0).getReg())) {
       
-      // Remove the a/x wapping code, saving 5 bytes
+      // Remove the a/x swapping code, saving 5 bytes
       prev1->eraseFromParent(); 
       prev2->eraseFromParent();
       prev3->eraseFromParent();
