@@ -69,27 +69,154 @@ struct MOSSPC700Entry {
 #include "MOSGenSearchableTables.inc"
 } // namespace MOS
 
+static cl::opt<bool> ForcePCRelReloc(
+    "mos-force-pcrel-reloc",
+    cl::desc("Force relocation entries to be emitted for PCREL fixups."),
+    cl::init(false), cl::Hidden);
+
 MCAsmBackend *createMOSAsmBackend(const Target &T, const MCSubtargetInfo &STI,
                                   const MCRegisterInfo &MRI,
                                   const llvm::MCTargetOptions &TO) {
   return new MOSAsmBackend(STI.getTargetTriple().getOS());
 }
 
-void MOSAsmBackend::applyFixup(const MCAssembler &Asm, const MCFixup &Fixup,
+bool MOSAsmBackend::fixupNeedsRelaxation(const MCFixup &Fixup,
+                                         uint64_t Value) const {
+  return true;
+}
+
+static int getRelativeMOSPCCorrection(const bool IsPCRel16) {
+  // MOS's PC relative addressing is off by one or two from the standard LLVM
+  // PC relative convention.
+  return IsPCRel16 ? -2 : -1;
+}
+
+static bool fitsIntoFixup(const int64_t SignedValue, const bool IsPCRel16) {
+  return SignedValue >= (IsPCRel16 ? INT16_MIN : INT8_MIN) &&
+         SignedValue <= (IsPCRel16 ? INT16_MAX : INT8_MAX);
+}
+
+// Derived from findAssociatedFragment.
+bool isBasedOnZeroPageSymbol(const MCExpr *E) {
+  switch (E->getKind()) {
+  case MCExpr::Target:
+    return isBasedOnZeroPageSymbol(cast<MOSMCExpr>(E)->getSubExpr());
+
+  case MCExpr::Constant:
+    return false;
+
+  case MCExpr::SymbolRef:
+    return cast<MCSymbolELF>(cast<MCSymbolRefExpr>(E)->getSymbol()).getOther() &
+           ELF::STO_MOS_ZEROPAGE;
+
+  case MCExpr::Unary:
+    return cast<MCUnaryExpr>(E)->getSubExpr()->findAssociatedFragment();
+
+  case MCExpr::Binary: {
+    const MCBinaryExpr *BE = cast<MCBinaryExpr>(E);
+    return isBasedOnZeroPageSymbol(BE->getLHS()) ||
+           isBasedOnZeroPageSymbol(BE->getRHS());
+  }
+  }
+
+  llvm_unreachable("Invalid assembly expression kind!");
+}
+
+bool MOSAsmBackend::fixupNeedsRelaxationAdvanced(const MCFixup &Fixup,
+                                                 const MCValue &Target,
+                                                 uint64_t Value,
+                                                 bool Resolved) const {
+  // On 65816, it is possible to zero-bank relax from Addr16 to Addr24. The
+  // assembler relaxes in a loop until instructions cannot be relaxed further,
+  // so this is able to follow zero-page relaxation.
+  bool BankRelax = false;
+  MOSAsmBackend::relaxInstructionTo(*RelaxedMC, *RelaxedSTI, BankRelax);
+
+  auto Info = getFixupKindInfo(Fixup.getKind());
+  const auto *MME = dyn_cast<MOSMCExpr>(Fixup.getValue());
+  // If this is a target-specific relaxation, e.g. a modifier, then the Info
+  // field already knows the exact width of the answer, so decide now.
+  if (MME != nullptr)
+    return (Info.TargetSize > (BankRelax ? 16 : 8));
+
+  // Now the fixup kind is not target-specific.  Yet, if it requires more than
+  // 8 (or 16) bits, then relaxation is needed.
+  if (Info.TargetSize > (BankRelax ? 16 : 8))
+    return true;
+
+  if (Info.Flags & MCFixupKindInfo::FKF_IsPCRel) {
+    const bool IsPCRel16 = Fixup.getKind() == (MCFixupKind)MOS::PCRel16;
+    assert((IsPCRel16 || Fixup.getKind() == (MCFixupKind)MOS::PCRel8) &&
+           "unexpected target fixup kind");
+    // This fixup concerns a relative branch.
+    // If the fixup is unresolved, we can't know if relaxation is needed.
+    return !Resolved ||
+           !fitsIntoFixup(Value + getRelativeMOSPCCorrection(IsPCRel16), false);
+  }
+
+  // See if the expression is derived from a zero page symbol.
+  if (isBasedOnZeroPageSymbol(Fixup.getValue()))
+    return false;
+
+  // In order to resolve an eight to sixteen bit possible relaxation, we need
+  // to figure out whether the symbol in question is in zero page or not.  If
+  // it is in zero page, then we don't need to do anything.  If not, we need
+  // to relax the instruction to 16 bits.
+  MCFragment *Frag = Fixup.getValue()->findAssociatedFragment();
+  if (!Frag)
+    return true;
+
+  // If we're not writing to ELF, punt on this whole idea, just do the
+  // relaxation for safety's sake
+  const auto *Sec = dyn_cast_if_present<MCSectionELF>(Frag->getParent());
+  if (!Sec)
+    return true;
+
+  // If the section of the symbol is marked with special zero-page flag
+  // then this is an 8 bit instruction and it doesn't need
+  // relaxation.
+  if (Sec->getFlags() & ELF::SHF_MOS_ZEROPAGE)
+    return false;
+
+  return !MOS::isZeroPageSectionName(Sec->getName());
+}
+
+MCFixupKindInfo MOSAsmBackend::getFixupKindInfo(MCFixupKind Kind) const {
+  if (Kind < FirstTargetFixupKind) {
+    return MCAsmBackend::getFixupKindInfo(Kind);
+  }
+
+  return MOSFixupKinds::getFixupKindInfo(static_cast<MOS::Fixups>(Kind), this);
+}
+
+bool MOSAsmBackend::shouldForceRelocation(const MCFixup &F, const MCValue &V) {
+  if (!ForcePCRelReloc)
+    return false;
+  return getFixupKindInfo(F.getKind()).Flags & MCFixupKindInfo::FKF_IsPCRel;
+}
+
+void MOSAsmBackend::applyFixup(const MCFragment &F, const MCFixup &Fixup,
                                const MCValue &Target,
                                MutableArrayRef<char> Data, uint64_t Value,
-                               bool IsResolved,
-                               const MCSubtargetInfo *STI) const {
+                               bool IsResolved) {
   unsigned int Kind = Fixup.getKind();
   uint32_t Offset = Fixup.getOffset();
 
-  if (Kind == MOS::AddrAsciz) {
+  switch (Kind) {
+  case MOS::AddrAsciz: {
     std::string ValueStr = utostr(Value);
     assert(((ValueStr.size() + 1 + Offset) <= Data.size()) &&
            "Invalid offset within MOS instruction for modifier!");
     std::copy(ValueStr.begin(), ValueStr.end(), Data.begin() + Offset);
     Data[Offset + ValueStr.size()] = '\0';
     return;
+  }
+  case MOS::PCRel8:
+  case MOS::PCRel16:
+    Value += getRelativeMOSPCCorrection(Kind == MOS::PCRel16);;
+    break;
+  default:
+    break;
   }
 
   unsigned int Bytes = 0;
@@ -135,161 +262,6 @@ void MOSAsmBackend::applyFixup(const MCAssembler &Asm, const MCFixup &Fixup,
     Out = Value & 0xff;
     Value = Value >> 8;
   }
-}
-
-bool MOSAsmBackend::fixupNeedsRelaxation(const MCFixup &Fixup,
-                                         uint64_t Value) const {
-  return true;
-}
-
-static cl::opt<bool> ForcePCRelReloc(
-    "mos-force-pcrel-reloc",
-    cl::desc("Force relocation entries to be emitted for PCREL fixups."),
-    cl::init(false), cl::Hidden);
-
-static int getRelativeMOSPCCorrection(const bool IsPCRel16) {
-  // MOS's PC relative addressing is off by one or two from the standard LLVM
-  // PC relative convention.
-  return IsPCRel16 ? -2 : -1;
-}
-
-static bool fitsIntoFixup(const int64_t SignedValue, const bool IsPCRel16) {
-  return SignedValue >= (IsPCRel16 ? INT16_MIN : INT8_MIN) &&
-         SignedValue <= (IsPCRel16 ? INT16_MAX : INT8_MAX);
-}
-
-bool MOSAsmBackend::evaluateTargetFixup(
-    const MCAssembler &Asm, const MCFixup &Fixup, const MCFragment *DF,
-    const MCValue &Target, const MCSubtargetInfo *STI, uint64_t &Value) {
-  // ForcePCRelReloc is a CLI option to force relocation emit, primarily for
-  // testing R_MOS_PCREL_*.
-  bool WasForced = ForcePCRelReloc;
-
-  const bool IsPCRel16 = Fixup.getKind() == (MCFixupKind)MOS::PCRel16;
-  assert((IsPCRel16 || Fixup.getKind() == (MCFixupKind)MOS::PCRel8) &&
-         "unexpected target fixup kind");
-
-  // Logic taken from MCAssembler::evaluateFixup.
-  bool IsResolved = false;
-  if (Target.getSubSym()) {
-    IsResolved = false;
-  } else if (!Target.getAddSym()) {
-    IsResolved = false;
-  } else {
-    const MCSymbol &SA = *Target.getAddSym();
-    if (SA.isUndefined()) {
-      IsResolved = false;
-    } else {
-      IsResolved = Asm.getWriter().isSymbolRefDifferenceFullyResolvedImpl(
-          Asm, SA, *DF, false, true);
-    }
-  }
-
-  Value = Target.getConstant();
-
-  if (const MCSymbol *A = Target.getAddSym()) {
-    if (A->isDefined())
-      Value += Asm.getSymbolOffset(*A);
-  }
-  if (const MCSymbol *B = Target.getSubSym()) {
-    if (B->isDefined())
-      Value -= Asm.getSymbolOffset(*B);
-  }
-
-  Value -= Asm.getFragmentOffset(*DF) + Fixup.getOffset();
-  Value += getRelativeMOSPCCorrection(IsPCRel16);
-
-  return IsResolved && !WasForced && fitsIntoFixup(Value, IsPCRel16);
-}
-
-// Derived from findAssociatedFragment.
-bool isBasedOnZeroPageSymbol(const MCExpr *E) {
-  switch (E->getKind()) {
-  case MCExpr::Target:
-    return isBasedOnZeroPageSymbol(cast<MOSMCExpr>(E)->getSubExpr());
-
-  case MCExpr::Constant:
-    return false;
-
-  case MCExpr::SymbolRef:
-    return cast<MCSymbolELF>(cast<MCSymbolRefExpr>(E)->getSymbol()).getOther() &
-           ELF::STO_MOS_ZEROPAGE;
-
-  case MCExpr::Unary:
-    return cast<MCUnaryExpr>(E)->getSubExpr()->findAssociatedFragment();
-
-  case MCExpr::Binary: {
-    const MCBinaryExpr *BE = cast<MCBinaryExpr>(E);
-    return isBasedOnZeroPageSymbol(BE->getLHS()) ||
-           isBasedOnZeroPageSymbol(BE->getRHS());
-  }
-  }
-
-  llvm_unreachable("Invalid assembly expression kind!");
-}
-
-bool MOSAsmBackend::fixupNeedsRelaxationAdvanced(const MCAssembler &Asm,
-                                                 const MCFixup &Fixup,
-                                                 const MCValue &Target,
-                                                 uint64_t Value,
-                                                 bool Resolved) const {
-  // On 65816, it is possible to zero-bank relax from Addr16 to Addr24. The
-  // assembler relaxes in a loop until instructions cannot be relaxed further,
-  // so this is able to follow zero-page relaxation.
-  bool BankRelax = false;
-  MOSAsmBackend::relaxInstructionTo(*RelaxedMC, *RelaxedSTI, BankRelax);
-
-  auto Info = getFixupKindInfo(Fixup.getKind());
-  const auto *MME = dyn_cast<MOSMCExpr>(Fixup.getValue());
-  // If this is a target-specific relaxation, e.g. a modifier, then the Info
-  // field already knows the exact width of the answer, so decide now.
-  if (MME != nullptr)
-    return (Info.TargetSize > (BankRelax ? 16 : 8));
-
-  // Now the fixup kind is not target-specific.  Yet, if it requires more than
-  // 8 (or 16) bits, then relaxation is needed.
-  if (Info.TargetSize > (BankRelax ? 16 : 8))
-    return true;
-
-  if (Info.Flags & MCFixupKindInfo::FKF_IsPCRel) {
-    // This fixup concerns a relative branch.
-    // If the fixup is unresolved, we can't know if relaxation is needed.
-    return !Resolved || !fitsIntoFixup(Value, false);
-  }
-
-  // See if the expression is derived from a zero page symbol.
-  if (isBasedOnZeroPageSymbol(Fixup.getValue()))
-    return false;
-
-  // In order to resolve an eight to sixteen bit possible relaxation, we need
-  // to figure out whether the symbol in question is in zero page or not.  If
-  // it is in zero page, then we don't need to do anything.  If not, we need
-  // to relax the instruction to 16 bits.
-  MCFragment *Frag = Fixup.getValue()->findAssociatedFragment();
-  if (!Frag)
-    return true;
-
-  // If we're not writing to ELF, punt on this whole idea, just do the
-  // relaxation for safety's sake
-  const auto *Sec = dyn_cast_if_present<MCSectionELF>(Frag->getParent());
-  if (!Sec)
-    return true;
-
-  // If the section of the symbol is marked with special zero-page flag
-  // then this is an 8 bit instruction and it doesn't need
-  // relaxation.
-  if (Sec->getFlags() & ELF::SHF_MOS_ZEROPAGE)
-    return false;
-
-  return !MOS::isZeroPageSectionName(Sec->getName());
-}
-
-MCFixupKindInfo MOSAsmBackend::getFixupKindInfo(MCFixupKind Kind) const {
-  if (Kind < FirstTargetFixupKind) {
-    return MCAsmBackend::getFixupKindInfo(Kind);
-  }
-
-  return MOSFixupKinds::getFixupKindInfo(static_cast<MOS::Fixups>(Kind), this);
 }
 
 unsigned MOSAsmBackend::relaxInstructionTo(const MCInst &Inst,

@@ -39,8 +39,8 @@ public:
 
   ~MOSObjectTargetWriter() override { val = 0; }
 
-  unsigned getRelocType(MCContext &Ctx, const MCValue &Target,
-                        const MCFixup &Fixup, bool IsPCRel) const override {
+  unsigned getRelocType(const MCFixup &Fixup, const MCValue &Target,
+                        bool IsPCRel) const override {
     return 0;
   }
 
@@ -60,33 +60,29 @@ public:
   std::unique_ptr<MCObjectTargetWriter>
   createObjectTargetWriter() const override;
 
-  /// Apply the \p Value for given \p Fixup into the provided data fragment, at
-  /// the offset specified by the fixup and following the fixup kind as
-  /// appropriate. Errors (such as an out of range fixup value) should be
-  /// reported via \p Ctx.
-  /// The  \p STI is present only for fragments of type MCRelaxableFragment and
-  /// MCDataFragment with hasInstructions() == true.
-  void applyFixup(const MCAssembler &Asm, const MCFixup &Fixup,
-                  const MCValue &Target, MutableArrayRef<char> Data,
-                  uint64_t Value, bool IsResolved,
-                  const MCSubtargetInfo *STI) const override;
-
-  bool evaluateTargetFixup(const MCAssembler &Asm, const MCFixup &Fixup,
-                           const MCFragment *DF, const MCValue &Target,
-                           const MCSubtargetInfo *STI,
-                           uint64_t &Value) override;
-
   /// Simple predicate for targets where !Resolved implies requiring relaxation
   bool fixupNeedsRelaxation(const MCFixup &Fixup,
                             uint64_t Value) const override;
   /// Carefully determine whether the instruction in question requires
   /// relaxation.  This implementation considers the fixup as well as
   /// the section that the symbol points to.
-  bool fixupNeedsRelaxationAdvanced(const MCAssembler &ASM,
-                                    const MCFixup &Fixup, const MCValue &Target,
+  bool fixupNeedsRelaxationAdvanced(const MCFixup &Fixup, const MCValue &Target,
                                     uint64_t Value,
                                     bool Resolved) const override;
   MCFixupKindInfo getFixupKindInfo(MCFixupKind Kind) const override;
+
+  bool shouldForceRelocation(const MCFixup &, const MCValue &) override;
+
+  /// Apply the \p Value for given \p Fixup into the provided data fragment, at
+  /// the offset specified by the fixup and following the fixup kind as
+  /// appropriate. Errors (such as an out of range fixup value) should be
+  /// reported via \p Ctx.
+  /// The  \p STI is present only for fragments of type MCRelaxableFragment and
+  /// MCDataFragment with hasInstructions() == true.
+  void applyFixup(const MCFragment &F, const MCFixup &Fixup,
+                  const MCValue &Target, MutableArrayRef<char> Data,
+                  uint64_t Value, bool IsResolved) override;
+
   /// Check whether the given instruction may need relaxation.
   ///
   /// \param Inst - The instruction to test.
