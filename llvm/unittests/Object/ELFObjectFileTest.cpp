@@ -285,6 +285,13 @@ TEST(ELFObjectFileTest, MachineTestForXtensa) {
     checkFormatAndArch(Data, Formats[Idx], Triple::xtensa);
 }
 
+TEST(ELFObjectFileTest, MachineTestForMOS) {
+  std::array<StringRef, 4> Formats = {"elf32-mos", "elf32-mos",
+                                      "elf64-unknown", "elf64-unknown"};
+  for (auto [Idx, Data] : enumerate(generateData(ELF::EM_MOS)))
+    checkFormatAndArch(Data, Formats[Idx], Triple::mos);
+}
+
 TEST(ELFObjectFileTest, CheckOSAndTriple) {
   std::tuple<uint16_t, uint8_t, StringRef> Formats[] = {
       {ELF::EM_AMDGPU, ELF::ELFOSABI_AMDGPU_HSA, "amdgcn-amd-amdhsa"},
@@ -737,7 +744,7 @@ Sections:
     Type: SHT_LLVM_BB_ADDR_MAP
     Link: 2
     Entries:
-      - Version: 1
+      - Version: 2
         BBRanges:
           - BaseAddress: 0x33333
             BBEntries:
@@ -904,7 +911,7 @@ Sections:
   SmallString<128> UnsupportedLowVersionYamlString(CommonYamlString);
   UnsupportedLowVersionYamlString += R"(
       - Version: 1
-        Feature: 0x4
+        Feature: 0x0
         BBRanges:
           - BBEntries:
               - AddressOffset: 0x0
@@ -915,8 +922,7 @@ Sections:
   {
     SCOPED_TRACE("unsupported version");
     DoCheck(UnsupportedLowVersionYamlString,
-            "version should be >= 2 for SHT_LLVM_BB_ADDR_MAP when PGO features "
-            "are enabled: version = 1 feature = 4");
+            "unsupported SHT_LLVM_BB_ADDR_MAP version: 1");
   }
 
   // Check that we fail when function entry count is enabled but not provided.
